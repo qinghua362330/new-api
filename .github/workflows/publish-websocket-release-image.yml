@@ -1,0 +1,97 @@
+name: Publish NewAPI WebSocket release image
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Immutable release tag, for example newapi-ws-311ff1a7
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-release-image:
+    name: Build linux/amd64 release image
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out exact source revision
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+
+      - name: Validate immutable release tag
+        id: build
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          SHA="$(git rev-parse HEAD)"
+          SHORT_SHA="$(git rev-parse --short=8 HEAD)"
+          case "${RELEASE_TAG}" in
+            *"${SHORT_SHA}") ;;
+            *)
+              echo "::error::release_tag must end with the checked-out short SHA ${SHORT_SHA}"
+              exit 1
+              ;;
+          esac
+          IMAGE_TAG="new-api-ws:${SHORT_SHA}"
+          ASSET="new-api-${RELEASE_TAG}-linux-amd64.tar.gz"
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "asset=${ASSET}" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "${RELEASE_TAG}" > VERSION
+
+      - name: Build exact linux/amd64 image
+        run: |
+          set -euo pipefail
+          docker build \
+            --platform linux/amd64 \
+            --label "org.opencontainers.image.revision=${{ steps.build.outputs.sha }}" \
+            --label "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}" \
+            --tag "${{ steps.build.outputs.image_tag }}" \
+            .
+
+      - name: Export, checksum, and describe image
+        env:
+          ASSET: ${{ steps.build.outputs.asset }}
+          IMAGE_TAG: ${{ steps.build.outputs.image_tag }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_SHA: ${{ steps.build.outputs.sha }}
+        run: |
+          set -euo pipefail
+          docker save "${IMAGE_TAG}" | gzip -9 > "${ASSET}"
+          sha256sum "${ASSET}" > "${ASSET}.sha256"
+          IMAGE_ID="$(docker image inspect "${IMAGE_TAG}" --format '{{.Id}}')"
+          cat > build-metadata.json <<EOF
+          {
+            "release_tag": "${RELEASE_TAG}",
+            "source_sha": "${SOURCE_SHA}",
+            "image_tag": "${IMAGE_TAG}",
+            "image_id": "${IMAGE_ID}",
+            "asset": "${ASSET}"
+          }
+          EOF
+
+      - name: Create immutable prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          ASSET: ${{ steps.build.outputs.asset }}
+          SOURCE_SHA: ${{ steps.build.outputs.sha }}
+        run: |
+          set -euo pipefail
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo "::error::release ${RELEASE_TAG} already exists and is immutable"
+            exit 1
+          fi
+          gh release create "${RELEASE_TAG}" \
+            --target "${SOURCE_SHA}" \
+            --title "NewAPI WebSocket ${RELEASE_TAG}" \
+            --notes "Immutable linux/amd64 image package for the exact source commit ${SOURCE_SHA}." \
+            --prerelease \
+            "${ASSET}" "${ASSET}.sha256" build-metadata.json
+
